@@ -1,13 +1,23 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
 import plotly.express as px
 from datetime import datetime, timedelta
+import firebase_admin
+from firebase_admin import credentials, firestore
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+import matplotlib.pyplot as plt
 
-# Sayfa Ayarları
+# Firebase'i başlat
+if not firebase_admin._apps:
+    cred = credentials.Certificate("/mnt/data/scregproject-firebase-adminsdk-fbsvc-4425e27c65.json")
+    firebase_admin.initialize_app(cred)
+
+db = firestore.client()
+
+# Streamlit ayarları
 st.set_page_config(page_title="Kafe Dashboard", layout="wide")
 
-# Stil ve Fontlar
+# Stil
 st.markdown("""
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap');
@@ -61,62 +71,42 @@ st.markdown("""
 with st.sidebar:
     st.title("☕ Menü")
     selected_date = st.date_input("Tarih Seçiniz", datetime.today())
-    refresh = st.button("🔄 Verileri Yenile")
 
-# Kahve verisi
-np.random.seed(42)
-coffee_list = [
-    "Espresso", "Americano", "Cappuccino", "Latte", "Mocha",
-    "Flat White", "Macchiato", "Cortado", "Turkish Coffee", "Irish Coffee"
-]
-coffee_prices = {coffee: round(np.random.randint(100, 201, 1)[0] / 10) * 10 for coffee in coffee_list}
+def get_orders_by_date(date_str):
+    orders_ref = db.collection('orders').document(date_str).collection('userOrders')
+    docs = orders_ref.stream()
+    orders = []
+    for doc in docs:
+        orders.append(doc.to_dict())
+    return orders
 
-@st.cache_data
-def generate_random_data():
-    dates = pd.date_range(end=datetime.today(), periods=60).to_pydatetime().tolist()
-    data = []
-    coffee_mean_sales = {coffee: np.random.randint(0, 31) for coffee in coffee_list}
-    
-    for date in dates:
-        daily_sales = {'date': date.strftime('%Y-%m-%d'), 'sales': []}
-        for coffee in coffee_list:
-            base_quantity = np.random.normal(coffee_mean_sales[coffee], 5)
-            if date.weekday() in [5, 6]:
-                base_quantity *= np.random.uniform(1.1, 1.3)
-            quantity = max(0, int(base_quantity))
-            daily_sales['sales'].append({'coffee': coffee, 'quantity': quantity, 'price': coffee_prices[coffee]})
-        data.append(daily_sales)
-    return data
-
-if 'data' not in st.session_state or refresh:
-    st.session_state.data = generate_random_data()
-
-# Tarih ve veri alma
-selected_date_str = selected_date.strftime('%Y-%m-%d')
-yesterday_date = selected_date - timedelta(days=1)
-yesterday_date_str = yesterday_date.strftime('%Y-%m-%d')
-
-def get_day_data(date_str):
-    for day in st.session_state.data:
-        if day['date'] == date_str:
-            return day
-    return None
-
-def calculate_total(day_data):
-    if not day_data:
-        return 0, {}
+def calculate_total(orders):
     total = 0
     product_counter = {}
-    for item in day_data['sales']:
-        total += item['quantity'] * item['price']
-        product_counter[item['coffee']] = item['quantity']
+    for order in orders:
+        for item in order.get("items", []):
+            name = item.get("name")
+            quantity = int(item.get("quantity", 0))
+            price = float(item.get("price", 0))
+            total += quantity * price
+            product_counter[name] = product_counter.get(name, 0) + quantity
     return total, product_counter
 
-today_data = get_day_data(selected_date_str)
-yesterday_data = get_day_data(yesterday_date_str)
+selected_date_str = selected_date.strftime('%Y-%m-%d')
+yesterday_str = (selected_date - timedelta(days=1)).strftime('%Y-%m-%d')
 
-today_total, today_products = calculate_total(today_data)
-yesterday_total, _ = calculate_total(yesterday_data)
+# Firestore verisi
+if 'data' not in st.session_state:
+    st.session_state.data = {}
+
+today_orders = get_orders_by_date(selected_date_str)
+yesterday_orders = get_orders_by_date(yesterday_str)
+
+st.session_state.data[selected_date_str] = today_orders
+
+# Günlük hesaplamalar
+today_total, today_products = calculate_total(today_orders)
+yesterday_total, _ = calculate_total(yesterday_orders)
 
 growth_percentage = ((today_total - yesterday_total) / yesterday_total * 100) if yesterday_total > 0 else 0
 
@@ -158,102 +148,41 @@ if today_products:
 
     with col6:
         st.markdown('<div class="metric-card"><h3 style="text-align:center;">📈 Son 30 Gün Ciro Trend</h3>', unsafe_allow_html=True)
-        trends = [{'Tarih': day['date'], 'Ciro': calculate_total(day)[0]} for day in st.session_state.data]
-        df_line = pd.DataFrame(trends[-30:])
+        trends = []
+        for i in range(30):
+            date_i = selected_date - timedelta(days=i)
+            date_str_i = date_i.strftime('%Y-%m-%d')
+            orders_i = get_orders_by_date(date_str_i)
+            total_i, _ = calculate_total(orders_i)
+            trends.append({'Tarih': date_str_i, 'Ciro': total_i})
+        df_line = pd.DataFrame(trends[::-1])
         fig_line = px.line(df_line, x='Tarih', y='Ciro', markers=True, color_discrete_sequence=['#7f5539'], template="plotly_dark")
         fig_line.update_layout(plot_bgcolor='rgba(74,44,23,0.7)', paper_bgcolor='rgba(74,44,23,0.7)',
                                font_color='#f5d9c7', xaxis=dict(showgrid=False), yaxis=dict(showgrid=False),
                                margin=dict(l=10, r=10, t=10, b=10))
         st.plotly_chart(fig_line, use_container_width=True)
 
-# Haftalık analiz
-st.markdown("<br>", unsafe_allow_html=True)
-st.markdown('<div class="metric-card"><h3 style="text-align:center;">🔮 Haftalık Satış Performansı</h3>', unsafe_allow_html=True)
+        # SARIMA tahmini
+        st.markdown('<div class="metric-card"><h3 style="text-align:center;">🔮 Gelecek 7 Gün Tahmini (SARIMA)</h3>', unsafe_allow_html=True)
+        df_line['Tarih'] = pd.to_datetime(df_line['Tarih'])
+        df_line.set_index('Tarih', inplace=True)
+        model = SARIMAX(df_line['Ciro'], order=(1,1,1), seasonal_order=(1,1,1,7))
+        results = model.fit(disp=False)
+        forecast = results.get_forecast(steps=7)
+        forecast_df = forecast.summary_frame()
+        forecast_df['Tarih'] = [df_line.index[-1] + timedelta(days=i+1) for i in range(7)]
 
-today = datetime.today()
-start_of_week = today - timedelta(days=today.weekday())
-dates_of_week = [(start_of_week + timedelta(days=i)).strftime('%Y-%m-%d') for i in range(7)]
-
-real_sales = []
-valid_dates = []
-for date_str in dates_of_week:
-    date_obj = datetime.strptime(date_str, '%Y-%m-%d')
-    if date_obj > today:
-        continue
-    day_data = get_day_data(date_str)
-    if day_data:
-        total, _ = calculate_total(day_data)
-        real_sales.append(total)
-        valid_dates.append(date_str)
-
-# Ortalama değerler
-weekday_totals = {i: [] for i in range(7)}
-for day in st.session_state.data:
-    date_obj = datetime.strptime(day['date'], '%Y-%m-%d')
-    weekday = date_obj.weekday()
-    total, _ = calculate_total(day)
-    weekday_totals[weekday].append(total)
-
-weekday_averages = {i: np.mean(weekday_totals[i]) if weekday_totals[i] else 0 for i in range(7)}
-expected_sales = [weekday_averages[datetime.strptime(d, '%Y-%m-%d').weekday()] for d in dates_of_week]
-
-df_week = pd.DataFrame({
-    'Tarih': valid_dates + dates_of_week,
-    'Ciro': real_sales + expected_sales,
-    'Tür': ['Gerçekleşen'] * len(valid_dates) + ['Beklenen'] * 7
-})
-
-fig_week = px.line(df_week, x='Tarih', y='Ciro', color='Tür', markers=True,
-                   color_discrete_map={'Gerçekleşen': '#d4a373', 'Beklenen': '#9c6644'}, template="plotly_dark")
-fig_week.update_layout(plot_bgcolor='rgba(74,44,23,0.7)', paper_bgcolor='rgba(74,44,23,0.7)',
-                       font_color='#f5d9c7', xaxis=dict(showgrid=False), yaxis=dict(showgrid=False),
-                       margin=dict(l=10, r=10, t=10, b=10), legend_title_text='Veri Türü')
-st.plotly_chart(fig_week, use_container_width=True)
-
-# Bugünün performansı
-today_str = today.strftime('%Y-%m-%d')
-if today_str in dates_of_week:
-    index_today = dates_of_week.index(today_str)
-    if index_today < len(real_sales):
-        today_real = real_sales[index_today]
-        today_expected = expected_sales[index_today]
-        difference_percentage = ((today_real - today_expected) / today_expected * 100) if today_expected > 0 else 0
-        if difference_percentage >= 0:
-            st.success(f"🎯 Bugün beklenenden %{difference_percentage:.1f} fazla satış yapıldı!")
-        else:
-            st.error(f"⚠️ Bugün beklenenden %{abs(difference_percentage):.1f} daha az satış yapıldı.")
-else:
-    st.info("Bugün haftalık dönem dışında.")
-
-# 30 günlük karşılaştırma
-today = datetime.today()
-last_30_days = today - timedelta(days=30)
-prev_30_days = today - timedelta(days=60)
-
-recent_sales = {coffee: 0 for coffee in coffee_list}
-previous_sales = {coffee: 0 for coffee in coffee_list}
-
-for day in st.session_state.data:
-    date_obj = datetime.strptime(day['date'], '%Y-%m-%d')
-    for sale in day['sales']:
-        if last_30_days <= date_obj <= today:
-            recent_sales[sale['coffee']] += sale['quantity']
-        elif prev_30_days <= date_obj < last_30_days:
-            previous_sales[sale['coffee']] += sale['quantity']
-
-declines = {}
-for coffee in coffee_list:
-    prev = previous_sales[coffee]
-    recent = recent_sales[coffee]
-    if prev > 0:
-        change = ((recent - prev) / prev) * 100
-        declines[coffee] = change
-
-if declines:
-    product_name, decline_percentage = min(declines.items(), key=lambda x: x[1])
-    if decline_percentage < 0:
-        st.error(f"⚠️ Son 30 gün içerisinde **{product_name}** satışları %{abs(decline_percentage):.1f} azaldı!!!")
-    else:
-        st.success(f"🎉 Son 30 gün içerisinde **{product_name}** satışları %{decline_percentage:.1f} arttı!!!")
-else:
-    st.info("Yeterli veri bulunamadı.")
+        df_forecast = pd.DataFrame({
+            'Tarih': forecast_df['Tarih'],
+            'Ciro': forecast_df['mean'],
+            'Tür': ['Tahmin']*7
+        })
+        df_combined = pd.concat([
+            df_line.reset_index().iloc[-7:][['Tarih', 'Ciro']].assign(Tür='Gerçek'),
+            df_forecast
+        ])
+        fig_forecast = px.line(df_combined, x='Tarih', y='Ciro', color='Tür', markers=True,
+                               color_discrete_map={'Gerçek': '#d4a373', 'Tahmin': '#9c6644'}, template="plotly_dark")
+        fig_forecast.update_layout(plot_bgcolor='rgba(74,44,23,0.7)', paper_bgcolor='rgba(74,44,23,0.7)',
+                                   font_color='#f5d9c7', margin=dict(l=10, r=10, t=10, b=10))
+        st.plotly_chart(fig_forecast, use_container_width=True)
