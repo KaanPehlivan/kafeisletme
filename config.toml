@@ -1,0 +1,6 @@
+[theme]
+primaryColor = "#c67c4e"             # Butonlar, vurgular
+backgroundColor = "#f3e6de"          # Sayfa arka planı (latte beyazı)
+secondaryBackgroundColor = "#e0c7b6" # Kartlar, kutular (latte açık)
+textColor = "#4b2e2b"                # Yazılar (koyu kahve)
+font = "sans serif"
